@@ -14,10 +14,6 @@ import psycopg2.extras
 
 app = FastAPI(title="Jobito Internal AI Chatbot")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
     "port":     os.getenv("DB_PORT", "5432"),
