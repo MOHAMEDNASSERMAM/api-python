@@ -1,18 +1,19 @@
 import os
-import json
-import re
+import sys
 import httpx
-import asyncio
-from datetime import datetime
-from collections import defaultdict
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException
+# Fix Arabic printing on Windows (cp1252 -> utf-8)
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import psycopg2
 import psycopg2.extras
+from transformers import pipeline
 
-app = FastAPI(title="Jobito Internal AI Chatbot")
+app = FastAPI(title="Jobito AI Chatbot (Local Generative AI)")
 
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
@@ -23,123 +24,111 @@ DB_CONFIG = {
     "options":  "-c search_path=ptj,public",
 }
 
-# Local Monitoring Endpoint (NestJS)
 NESTJS_MONITORING_URL = os.getenv("NESTJS_MONITORING_URL", "http://localhost:3000/monitoring/log")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MONITORING BRIDGE (BAM) - Local Only
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def report_to_bam(message: str, metadata: Dict[str, Any] = None):
-    """Reports internal chatbot events/errors to the NestJS monitoring system."""
+async def report_to_bam(message: str, metadata: Dict = None):
     try:
         async with httpx.AsyncClient() as client:
-            payload = {
-                "message": f"[ChatBot-Internal] {message}",
+            await client.post(NESTJS_MONITORING_URL, json={
+                "message": f"[ChatBot-LocalAI] {message}",
                 "metadata": metadata or {}
-            }
-            await client.post(NESTJS_MONITORING_URL, json=payload, timeout=1.0)
+            }, timeout=1.0)
     except:
-        pass # Don't crash if monitoring is down
-
-INTENT_PATTERNS = {
-    "search_jobs": [
-        r"وظيفة", r"شغل", r"بحث", r"دور", r"عايز", r"فرصة",
-        r"job", r"work", r"search", r"find", r"vacancy"
-    ],
-    "company_info": [
-        r"شركة", r"شركات", r"معلومات", r"مين",
-        r"company", r"companies", r"about", r"who"
-    ],
-    "application_status": [
-        r"طلبي", r"تقديم", r"حالة", r"وصل", r"قدمت",
-        r"status", r"applied", r"my application", r"tracking"
-    ],
-    "platform_stats": [
-        r"أرقام", r"إحصائيات", r"كم", r"عدد",
-        r"stats", r"statistics", r"how many", r"count"
-    ],
-    "help": [
-        r"مساعدة", r"تفعيل", r"مشكلة", r"ازاي",
-        r"help", r"support", r"how to", r"problem"
-    ],
-    "greeting": [
-        r"سلام", r"مرحبا", r"أهلا", r"هاي", r"صباح", r"مساء",
-        r"hi", r"hello", r"hey", "welcome"
-    ]
-}
-
-def analyze_intent_locally(message: str) -> Dict[str, Any]:
-    """Purely local intent detection without any external calls."""
-    msg = message.lower().strip()
-    detected_intent = "unknown"
-    
-    # 1. Intent Detection
-    for intent, patterns in INTENT_PATTERNS.items():
-        if any(re.search(p, msg) for p in patterns):
-            detected_intent = intent
-            break
-            
-    # 2. Basic Entity Extraction
-    filters = {
-        "keyword": None,
-        "job_type": None,
-        "location": None
-    }
-    
-    # Simple extraction logic (can be expanded)
-    if "في" in msg:
-        parts = msg.split("في")
-        if len(parts) > 1:
-            filters["location"] = parts[1].strip()
-            
-    # 3. Language detection
-    lang = "ar" if any("\u0600" <= c <= "\u06FF" for c in message) else "en"
-    
-    return {
-        "intent": detected_intent,
-        "filters": filters,
-        "language": lang
-    }
+        pass
 
 def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-async def query_db(sql: str, params: tuple = None, fetchone: bool = False):
-    conn = None
-    try:
-        conn = get_connection()
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params or ())
-            if cur.description:
-                return dict(cur.fetchone()) if fetchone else [dict(r) for r in cur.fetchall()]
-            return []
-    except Exception as e:
-        await report_to_bam(f"DB Error: {str(e)}", {"sql": sql})
-        return []
-    finally:
-        if conn: conn.close()
 
-async def handle_request(analysis: dict, user_id: str) -> str:
-    intent = analysis["intent"]
-    lang = analysis["language"]
+print("جاري تحميل نموذج الذكاء الاصطناعي المحلي (Qwen2.5-0.5B-Instruct)...")
+print("ملاحظة: هذا قد يستغرق بعض الوقت (لتحميل حوالي 1-2 جيجابايت في المرة الأولى) وسيعمل محلياً بالكامل.")
+
+try:
+    # Use HuggingFace pipeline with a small instruction model that supports Arabic heavily
+    ai_pipeline = pipeline(
+        "text-generation",
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        device="cpu", # Defaults to CPU so it runs safely anywhere. Change to "cuda" for GPU speedup.
+    )
+    print("تم تحميل النموذج المحلي بنجاح! السيرفر جاهز للعمل.")
+except Exception as e:
+    print(f"حدث خطأ أثناء تحميل النموذج المحلي: {e}")
+    ai_pipeline = None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTEXT RETRIEVAL (RAG) & MEMORY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Simple in-memory memory store: {user_id: [messages]}
+chat_memory: Dict[str, list] = {}
+
+def get_db_context(user_msg: str) -> str:
+    """Intelligently decides what to fetch from DB based on intent."""
+    context_parts = []
     
-    if intent == "greeting":
-        return "أهلاً بك في Jobito! كيف يمكنني مساعدتك اليوم؟" if lang == "ar" else "Hello! How can I help you today?"
-        
-    if intent == "search_jobs":
-        sql = "SELECT title, title_en FROM jobs WHERE is_active = TRUE LIMIT 3"
-        rows = await query_db(sql)
-        if not rows: return "عذراً، لم أجد وظائف حالياً." if lang == "ar" else "No jobs found."
-        titles = [r["title"] or r["title_en"] for r in rows]
-        return "إليك بعض الوظائف: " + ", ".join(titles)
-        
-    if intent == "platform_stats":
-        total_jobs = await query_db("SELECT COUNT(*) FROM jobs", fetchone=True)
-        count = total_jobs.get("count", 0)
-        return f"يوجد لدينا حالياً {count} وظيفة نشطة." if lang == "ar" else f"We have {count} active jobs."
+    # 1. Job search intent
+    if any(k in user_msg for k in ["وظيفة", "وظائف", "شغل", "اعمل", "job", "work", "career"]):
+        context_parts.append(fetch_jobs_context(user_msg))
+    
+    # 2. Company search intent
+    if any(k in user_msg for k in ["شركة", "شركات", "company", "info about"]):
+        context_parts.append(fetch_company_context(user_msg))
 
-    return "أنا مساعدك الذكي لـ Jobito، يمكنك سؤالي عن الوظائف أو الشركات." if lang == "ar" else "I can help you with jobs or companies."
+    # 3. Help/FAQ intent
+    if any(k in user_msg for k in ["كيف", "مساعدة", "help", "how to", "مشكلة"]):
+        context_parts.append(fetch_help_context(user_msg))
+
+    return "\n".join([p for p in context_parts if p])
+
+def fetch_jobs_context(query: str):
+    # Extract potential keywords (simple split for now)
+    keywords = [w for w in query.split() if len(w) > 3]
+    search_term = f"%{keywords[0]}%" if keywords else "%"
+    
+    sql = """
+        SELECT title, salary_min, salary_max 
+        FROM ptj.jobs 
+        WHERE (title ILIKE %s OR description ILIKE %s) AND is_active = TRUE 
+        LIMIT 3
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, (search_term, search_term))
+                jobs = cur.fetchall()
+                if not jobs: return ""
+                res = "الوظائف المتاحة حالياً والمناسبة لطلبك: "
+                res += "، ".join([f"{j['title']} (راتب: {j['salary_min']}-{j['salary_max']})" for j in jobs])
+                return res
+    except: return ""
+
+def fetch_company_context(query: str):
+    sql = "SELECT name, industry, description FROM companies WHERE name ILIKE %s OR description ILIKE %s LIMIT 1"
+    # Try to find a specific company name if mentioned
+    search_term = "%"
+    words = query.split()
+    if len(words) > 1: search_term = f"%{words[-1]}%"
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, (search_term, search_term))
+                c = cur.fetchone()
+                if not c: return ""
+                return f"معلومات عن شركة {c['name']} ({c['industry']}): {c['description'][:150]}..."
+    except: return ""
+
+def fetch_help_context(query: str):
+    sql = "SELECT title, content FROM ptj.help_articles WHERE title ILIKE %s OR content ILIKE %s LIMIT 1"
+    search_term = f"%{query.split()[-1]}%" if query.split() else "%"
+    try:
+        with get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, (search_term, search_term))
+                h = cur.fetchone()
+                if not h: return ""
+                return f"إليك المساعدة بخصوص {h['title']}: {h['content'][:200]}..."
+    except: return ""
 
 class ChatRequest(BaseModel):
     message: str
@@ -149,12 +138,58 @@ class ChatRequest(BaseModel):
 async def chat(request: ChatRequest):
     if not request.message:
         raise HTTPException(status_code=400, detail="Empty message")
-        
-    analysis = analyze_intent_locally(request.message)
     
-    reply = await handle_request(analysis, request.user_id)
+    if not ai_pipeline:
+        raise HTTPException(status_code=500, detail="عذراً، نظام الذكاء الاصطناعي المحلي غير متاح حالياً.")
+
+    user_id = request.user_id or "guest"
+    user_msg = request.message
+    
+    # 1. Retrieve Context from Database
+    db_context = get_db_context(user_msg.lower())
+
+    # 2. Manage Memory (Last 4 rounds)
+    if user_id not in chat_memory:
+        chat_memory[user_id] = []
+    
+    # 3. Build Prompt with History
+    sys_prompt = "أنت مساعد ذكي لمنصة Jobito. أجِب بأسلوب عربي ودود ومختصر. استخدم المعلومات المتاحة من قاعدة البيانات فقط للرد بدقة."
+    if db_context:
+        sys_prompt += f"\n\nمعلومات من النظام:\n{db_context}"
+
+    messages = [{"role": "system", "content": sys_prompt}]
+    
+    # Add history
+    for old_msg in chat_memory[user_id][-4:]:
+        messages.append(old_msg)
+    
+    # Add current message
+    messages.append({"role": "user", "content": user_msg})
+
+    # 4. Ask Local Generative AI
+    try:
+        result = ai_pipeline(
+            messages,
+            max_new_tokens=200,
+            temperature=0.6,
+            do_sample=True,
+        )
+        reply = result[0]["generated_text"][-1]["content"]
+        
+        # Save to memory
+        chat_memory[user_id].append({"role": "user", "content": user_msg})
+        chat_memory[user_id].append({"role": "assistant", "content": reply})
+        # Keep memory short
+        if len(chat_memory[user_id]) > 10: chat_memory[user_id] = chat_memory[user_id][-10:]
+
+    except Exception as e:
+        await report_to_bam(f"Local AI Error: {str(e)}")
+        reply = "عذراً، واجهت مشكلة في التفكير. حاول مرة أخرى."
+        print(f"[Error]: {e}")
+
     return {"reply": reply}
 
 if __name__ == "__main__":
     import uvicorn
+    # Use multiple workers carefully; loading LLM in memory per worker requires significant RAM
     uvicorn.run(app, host="0.0.0.0", port=5000)

@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 from deep_translator import GoogleTranslator
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 app = FastAPI(title="Jobito Stateless Translation Service")
 
@@ -14,6 +17,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Shared thread pool for parallel translations
+executor = ThreadPoolExecutor(max_workers=10)
 
 # Pre-instantiated translators for common pairs
 translators = {
@@ -29,19 +35,24 @@ class TranslateRequest(BaseModel):
     source_lang: str = "auto"
     target_lang: str = "en"
 
-def translate_single(text: str, source: str, target: str):
-    if not text:
-        return ""
-        
+@lru_cache(maxsize=1024)
+def _get_translator(source, target):
     key = f"{source}_{target}"
     translator = translators.get(key)
     if not translator:
         translator = GoogleTranslator(source=source, target=target)
-    
+    return translator
+
+@lru_cache(maxsize=2048)
+def translate_single_sync(text: str, source: str, target: str):
+    if not text or not text.strip():
+        return text
+        
+    translator = _get_translator(source, target)
     try:
         return translator.translate(text)
     except Exception as e:
-        print(f"Translation error: {e}")
+        print(f"⚠️ Translation error for '{text[:20]}...': {e}")
         return text
 
 @app.get("/health")
@@ -63,43 +74,28 @@ async def translate(req: TranslateRequest):
     print(f"📥 [Batch Request]: {len(texts)} items | {source} -> {target}")
 
     try:
-        key = f"{source}_{target}"
-        translator = translators.get(key)
-        if not translator:
-            translator = GoogleTranslator(source=source, target=target)
-            translators[key] = translator
+        # Use native batch translation for massive speed boost and to stop Google from blocking the IP
+        # We replace empty strings with a space as deep_translator batching requires valid strings
+        safe_texts = [t if (t and t.strip()) else " " for t in texts]
+        translator = _get_translator(source, target)
         
-        # Limit batch size to prevent Google API blocks or timeouts
-        MAX_BATCH = 25
-        results = []
+        # Deep_translator's batch translation uses optimized grouping
+        raw_results = await asyncio.to_thread(translator.translate_batch, safe_texts)
         
-        for i in range(0, len(texts), MAX_BATCH):
-            batch = [t for t in texts[i:i+MAX_BATCH] if t and t.strip()]
-            if not batch:
-                results.extend([""] * (min(i + MAX_BATCH, len(texts)) - i))
-                continue
+        # Restore empty strings if any
+        results = [r.strip() if r and r.strip() else text for r, text in zip(raw_results, texts)]
                 
-            try:
-                translated_batch = translator.translate_batch(batch)
-                results.extend(translated_batch)
-            except Exception as batch_err:
-                print(f"⚠️ Chunk translation error: {batch_err}. Falling back to single mode.")
-                for individual_text in batch:
-                    results.append(translate_single(individual_text, source, target))
-        
-        # Ensure results match input length
-        while len(results) < len(texts):
-            results.append(texts[len(results)])
 
-        print(f"✅ Success | Latency: {time.time() - start_time:.2f}s")
+        latency = time.time() - start_time
+        print(f"✅ Success | Parallel Latency: {latency:.2f}s")
         
         if req.text:
-            return {"translated_text": results[0], "latency": f"{time.time() - start_time:.4f}s"}
+            return {"translated_text": results[0], "latency": f"{latency:.4f}s"}
         
         return {
             "translated_texts": results,
             "count": len(results),
-            "latency": f"{time.time() - start_time:.4f}s"
+            "latency": f"{latency:.4f}s"
         }
 
     except Exception as e:
@@ -113,8 +109,9 @@ async def translate(req: TranslateRequest):
 if __name__ == "__main__":
     import uvicorn
     import sys
-    print("🚀 Starting Resilient Translation service on port 5001...")
+    print("🚀 Starting Optimized Translation service on port 5001...")
     try:
+        # Run with multiple workers for concurrency, though ThreadPool handles the CPU/IO wait
         uvicorn.run(app, host="0.0.0.0", port=5001, log_level="info")
     except KeyboardInterrupt:
         print("\n👋 Service stopped by user.")
