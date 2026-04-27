@@ -7,3 +7,6 @@ torch
 transformers
 accelerate
 deep-translator==1.11.4
+pymongo==4.10.1
+Pillow
+einops
